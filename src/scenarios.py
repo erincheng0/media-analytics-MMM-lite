@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 
 WEEKLY_INPUT_PATH = Path("outputs/weekly_campaign_dataset.csv")
+MODEL_INPUT_PATH = Path("outputs/campaign_model_dataset.csv")
 SCENARIO_OUTPUT_PATH = Path("outputs/campaign_scenario_results.csv")
 
 
@@ -36,69 +37,95 @@ def summarize_campaign_performance(weekly_campaign: pd.DataFrame) -> pd.DataFram
     return campaign_perf.sort_values("roas", ascending=False)
 
 
-def simulate_campaign_budget_shift(
+def campaign_to_col(name: str) -> str:
+    return f"spend_{name.strip().lower().replace(' ', '_').replace('-', '_')}"
+
+
+def simulate_campaign_budget_shift_model(
+    model,
+    model_df: pd.DataFrame,
     campaign_perf: pd.DataFrame,
     shift_pct: float = 0.10,
     top_n: int = 2,
     bottom_n: int = 2,
-) -> pd.DataFrame:
-    campaign_perf = campaign_perf.sort_values("roas", ascending=False).copy()
+) -> dict:
+    """Reallocates budget from bottom-ROAS to top-ROAS campaigns, then re-predicts
+    revenue with the fitted Ridge model instead of assuming flat ROAS.
+    """
+    ranked = campaign_perf.sort_values("roas", ascending=False)
+    top_campaigns = ranked.head(top_n)["campaign"].tolist()
+    bottom_campaigns = ranked.tail(bottom_n)["campaign"].tolist()
 
-    if campaign_perf["campaign"].nunique() < 2:
-        raise ValueError("Need at least 2 campaigns for campaign-level budget reallocation.")
+    top_cols = [campaign_to_col(c) for c in top_campaigns]
+    bottom_cols = [campaign_to_col(c) for c in bottom_campaigns]
 
-    top_campaigns = campaign_perf.head(top_n)["campaign"].tolist()
-    bottom_campaigns = campaign_perf.tail(bottom_n)["campaign"].tolist()
+    feature_cols = [c for c in model_df.columns if c not in ["week_start", "revenue"]]
+    baseline_X = model_df[feature_cols].copy()
+    scenario_X = baseline_X.copy()
 
-    current_budget = campaign_perf.set_index("campaign")["spend"].to_dict()
-    scenario_budget = current_budget.copy()
+    shift_amounts = baseline_X[bottom_cols] * shift_pct
+    scenario_X[bottom_cols] = baseline_X[bottom_cols] - shift_amounts
+    weekly_total_shift = shift_amounts.sum(axis=1)
+    for col in top_cols:
+        scenario_X[col] = baseline_X[col] + weekly_total_shift / len(top_cols)
 
-    total_shift = 0
-    for campaign in bottom_campaigns:
-        shift_amt = current_budget[campaign] * shift_pct
-        scenario_budget[campaign] -= shift_amt
-        total_shift += shift_amt
+    baseline_pred = model.predict(baseline_X)
+    scenario_pred = model.predict(scenario_X)
 
-    for campaign in top_campaigns:
-        scenario_budget[campaign] += total_shift / len(top_campaigns)
+    weekly_results = pd.DataFrame({
+        "week_start": model_df["week_start"],
+        "baseline_predicted_revenue": baseline_pred,
+        "scenario_predicted_revenue": scenario_pred,
+    })
+    weekly_results["revenue_lift"] = (
+        weekly_results["scenario_predicted_revenue"] - weekly_results["baseline_predicted_revenue"]
+    )
 
-    scenario_df = pd.DataFrame({
-        "campaign": list(current_budget.keys()),
-        "current_spend": list(current_budget.values()),
-        "scenario_spend": [scenario_budget[c] for c in current_budget.keys()],
+    spend_summary = pd.DataFrame({
+        "campaign": [c.replace("spend_", "") for c in feature_cols if c.startswith("spend_")],
+        "current_spend": [baseline_X[c].sum() for c in feature_cols if c.startswith("spend_")],
+        "scenario_spend": [scenario_X[c].sum() for c in feature_cols if c.startswith("spend_")],
     })
 
-    scenario_df = scenario_df.merge(
-        campaign_perf[["campaign", "roas", "conversion_rate"]],
-        on="campaign",
-        how="left",
-    )
+    totals = {
+        "total_baseline_predicted_revenue": weekly_results["baseline_predicted_revenue"].sum(),
+        "total_scenario_predicted_revenue": weekly_results["scenario_predicted_revenue"].sum(),
+        "total_predicted_revenue_lift": weekly_results["revenue_lift"].sum(),
+    }
 
-    scenario_df["projected_revenue_current"] = scenario_df["current_spend"] * scenario_df["roas"]
-    scenario_df["projected_revenue_scenario"] = scenario_df["scenario_spend"] * scenario_df["roas"]
-    scenario_df["projected_revenue_lift"] = (
-        scenario_df["projected_revenue_scenario"] - scenario_df["projected_revenue_current"]
-    )
-
-    return scenario_df.sort_values("projected_revenue_lift", ascending=False)
+    return {
+        "weekly_results": weekly_results,
+        "spend_summary": spend_summary,
+        "totals": totals,
+    }
 
 
-def save_campaign_scenario_results(df: pd.DataFrame, path: Path = SCENARIO_OUTPUT_PATH) -> Path:
+def save_campaign_scenario_results(spend_summary: pd.DataFrame, path: Path = SCENARIO_OUTPUT_PATH) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(path, index=False)
+    spend_summary.to_csv(path, index=False)
     return path
 
 
 if __name__ == "__main__":
+    from src.model import fit_mmm_lite_campaign
+
     weekly_campaign = load_weekly_campaign_data(WEEKLY_INPUT_PATH)
+    model_df = pd.read_csv(MODEL_INPUT_PATH, parse_dates=["week_start"])
     campaign_perf = summarize_campaign_performance(weekly_campaign)
-    scenario_df = simulate_campaign_budget_shift(
-        campaign_perf,
+
+    model, preds, metrics, coef_df = fit_mmm_lite_campaign(model_df)
+
+    scenario = simulate_campaign_budget_shift_model(
+        model=model,
+        model_df=model_df,
+        campaign_perf=campaign_perf,
         shift_pct=0.10,
         top_n=2,
         bottom_n=2,
     )
-    save_path = save_campaign_scenario_results(scenario_df, SCENARIO_OUTPUT_PATH)
+
+    save_path = save_campaign_scenario_results(scenario["spend_summary"], SCENARIO_OUTPUT_PATH)
 
     print(f"Saved scenario results to: {save_path}")
-    print(scenario_df)
+    print(scenario["totals"])
+    print(scenario["spend_summary"])

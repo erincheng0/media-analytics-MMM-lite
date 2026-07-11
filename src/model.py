@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 from sklearn.linear_model import Ridge
 from sklearn.metrics import r2_score, mean_absolute_error
+from sklearn.model_selection import LeaveOneOut, cross_val_predict
 
 INPUT_PATH = Path("data/processed/final_dataset.csv")
 WEEKLY_OUTPUT_PATH = Path("outputs/weekly_campaign_dataset.csv")
@@ -110,3 +111,18 @@ if __name__ == "__main__":
 
     print(metrics)
     print(coef_df.head())
+
+def evaluate_model_cv(model_df: pd.DataFrame, alpha: float = 1.0) -> dict:
+    """Leave-one-out CV — appropriate given only ~27 weekly rows.
+    In-sample R²/MAE are optimistic; this gives an honest generalization estimate.
+    """
+    X_cols = [c for c in model_df.columns if c not in ["week_start", "revenue"]]
+    X = model_df[X_cols]
+    y = model_df["revenue"]
+
+    cv_preds = cross_val_predict(Ridge(alpha=alpha), X, y, cv=LeaveOneOut())
+
+    return {
+        "cv_r2": r2_score(y, cv_preds),
+        "cv_mae": mean_absolute_error(y, cv_preds),
+    }
