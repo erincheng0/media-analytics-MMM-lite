@@ -126,3 +126,23 @@ def evaluate_model_cv(model_df: pd.DataFrame, alpha: float = 1.0) -> dict:
         "cv_r2": r2_score(y, cv_preds),
         "cv_mae": mean_absolute_error(y, cv_preds),
     }
+def fit_mmm_lite_campaign(model_df: pd.DataFrame, alpha: float = 1.0):
+    X_cols = [c for c in model_df.columns if c not in ["week_start", "revenue"]]
+    X = model_df[X_cols]
+    y = model_df["revenue"]
+
+    model = Ridge(alpha=alpha)
+    model.fit(X, y)
+    preds = model.predict(X)
+
+    metrics = {
+        "r2": r2_score(y, preds),
+        "mae": mean_absolute_error(y, preds),
+    }
+
+    coef_df = pd.DataFrame({
+        "feature": X_cols,
+        "coefficient": model.coef_,
+    }).sort_values("coefficient", ascending=False)
+
+    return model, preds, metrics, coef_df
